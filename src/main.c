@@ -10,36 +10,57 @@
 #include "minimal_wifi.h"
 #include "driver/gpio.h"
 #include "driver/adc.h"
+#include "mqtt_client.h"
+#include "esp_sleep.h"
+#include <math.h>  
 // Configure the WiFi network settings here
-
-#define WIFI_SSID      "Tufts_Wireless"
-#define WIFI_PASS      ""
-
-static const char *TAG = "wifi demo";
 
 
 #define I2C_PORT I2C_NUM_0
 #define I2C_FREQ_HZ 100000
-#define STS31_ADDR 0x4A
+#define TMP1075_ADDR  0x48
 #define CMD_MSB 0x24
 #define CMD_LSB 0x16
 #define MEAS_DELAY_MS 25
 
-static i2c_master_bus_handle_t bus;
-static i2c_master_dev_handle_t dev;
-
-
 #define ADC_VREF            3.3f
 #define ADC_SAMPLES         32
 
-#define SDA_PIN 7
-#define SCL_PIN 6
-#define LED_GPIO 2
+#define SDA_PIN 5
+#define SCL_PIN 4
+#define LED_GPIO 1
 #define NTC_ADC_CH          ADC_CHANNEL_0
+
+
+#define WIFI_SSID      "Tufts_Wireless"
+#define WIFI_PASS      ""
+#define BROKER_URI "mqtt://bell-mqtt.eecs.tufts.edu"
+
+
+static i2c_master_bus_handle_t bus;
+static i2c_master_dev_handle_t dev;
+
+static const char *TAG = "Iteration 2, Group 1";
+
+esp_mqtt_client_handle_t client;
+
 
 static void init_adc(void) {
     adc1_config_width(ADC_WIDTH_BIT_12);
     adc1_config_channel_atten(NTC_ADC_CH, ADC_ATTEN_DB_11); // up to ~3.3V
+}
+
+static void mqttinit(){
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = BROKER_URI,
+    };
+    client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_start(client);
+}
+
+//to do
+static void publishmqtt(float temp, float battery, float rrsi){
+    //esp_mqtt_client_publish(client, "tshen06/iteration1/thermistor_temp", t_ntc_buffer, 0, 0, 0);
 }
 
 float readvoltage(void) {
@@ -52,61 +73,51 @@ float readvoltage(void) {
     return v;
 }
 
-void i2cinit()
+void i2cinit(void)
 {
-    // I2C init
     i2c_master_bus_config_t b = {
         .i2c_port = I2C_PORT,
         .scl_io_num = SCL_PIN,
         .sda_io_num = SDA_PIN,
         .clk_source = I2C_CLK_SRC_DEFAULT,
-        .flags = {.enable_internal_pullup = 1},
+        .flags = {.enable_internal_pullup = 1},   // still OK, but add externals on PCB
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&b, &bus));
+
     i2c_device_config_t d = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = STS31_ADDR,
+        .device_address = TMP1075_ADDR,
         .scl_speed_hz = I2C_FREQ_HZ,
     };
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &d, &dev));
 }
 
-// static uint8_t crc8_sens(const uint8_t *d, size_t n)
-// {
-//     uint8_t c = 0xFF;
-//     for (size_t i = 0; i < n; i++)
-//     {
-//         c ^= d[i];
-//         for (int b = 0; b < 8; b++)
-//             c = (c & 0x80) ? (uint8_t)((c << 1) ^ 0x31) : (uint8_t)(c << 1);
-//     }
-//     return c;
-// }
+
+
 
 static float get_temp_ic(void)
 {
-    uint8_t cmd[2] = {CMD_MSB, CMD_LSB};
-    uint8_t rx[3] = {0};
+    // 1) Pointer to temperature register (0x00)
+    uint8_t ptr = 0x00;
+    uint8_t rx[2] = {0};
 
-    // robust: one-call TxRx with retry once
-    esp_err_t e = i2c_master_transmit_receive(dev, cmd, 2, rx, 3, 300);
-    if (e != ESP_OK)
-    {
-        vTaskDelay(pdMS_TO_TICKS(MEAS_DELAY_MS));
-        e = i2c_master_transmit_receive(dev, cmd, 2, rx, 3, 300);
-        if (e != ESP_OK)
-            return -999.9;
-    }
-    else
-    {
-        vTaskDelay(pdMS_TO_TICKS(MEAS_DELAY_MS));
-        if (i2c_master_receive(dev, rx, 3, 300) != ESP_OK)
-            return -99.9; // some controllers prefer explicit read
+    // Combined write-then-read: [ADDR+W][0x00] + repeated START + [ADDR+R][2 bytes]
+    esp_err_t e = i2c_master_transmit_receive(dev, &ptr, 1, rx, 2, 300);
+    if (e != ESP_OK) {
+        ESP_LOGE("TMP1075", "I2C read failed: %s", esp_err_to_name(e));
+        return NAN;   // or -999.9f
     }
 
-    uint16_t raw = ((uint16_t)rx[0] << 8) | rx[1];
-    return -45.0f + 175.0f * ((float)raw / 65535.0f);
+    // 2) Convert to 12-bit two's complement
+    int16_t raw = ((int16_t)rx[0] << 8) | rx[1];
+    raw >>= 4;  // top 12 bits are temperature
+
+    // 3) Each LSB = 0.0625°C
+    float temp_c = (float)raw * 0.0625f;
+    return temp_c;
 }
+
+
 void nvsinit(){
     ESP_LOGI(TAG, "STARTING APPLICATION");
     esp_err_t ret = nvs_flash_init();
@@ -122,24 +133,37 @@ void wifiinit(){
     wifi_connect(WIFI_SSID, WIFI_PASS);
 }
 void ledinit(){
-        // Configure pin as output
+    // Configure pin as output
     gpio_reset_pin(LED_GPIO);
     gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
-
-}
-void turnonled(void)
-{
-
-    // Set HIGH
     gpio_set_level(LED_GPIO, 1);
-    printf("GPIO %d HIGH\n", LED_GPIO);
+}
 
-    // Wait 1 second
-    // vTaskDelay(pdMS_TO_TICKS(1000));
+void ledflash(void)
+{
+    for (int i=0; i<5; i++){
+        gpio_set_level(LED_GPIO, 0);
+        printf("GPIO %d HIGH\n", LED_GPIO);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        gpio_set_level(LED_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+}
 
-    // // Set LOW
-    // gpio_set_level(LED_GPIO, 0);
-    // printf("GPIO %d LOW\n", LED_GPIO);
+void enterDeepSleep(){
+    ESP_LOGI("SLEEP", "Device is going to sleep for 10 second...");
+
+    // 1 hour = 3600 seconds
+    const int64_t sleep_time_us = 10LL * 1000000LL;
+
+    // Configure wakeup source: timer
+    esp_sleep_enable_timer_wakeup(sleep_time_us);
+
+    // Optional: flush logs
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Enter deep sleep
+    esp_deep_sleep_start();
 }
 
 void app_main(void)
@@ -149,13 +173,12 @@ void app_main(void)
     ledinit();
     i2cinit();
     wifiinit();
-    while(1) {
-        float t_ic = get_temp_ic();
-        printf("temperature is: %6.2f °C", t_ic);
-        float batt_vol = readvoltage();
-        printf("Battery percentage is is: %6.2f °C", batt_vol);
-        turnonled();
-        vTaskDelay(1000);
-    }
+    mqttinit();
+    float t_ic = get_temp_ic();
+    printf("temperature is: %6.2f °C", t_ic);
+    float batt_vol = readvoltage();
+    printf("Battery percentage is is: %6.2f", batt_vol); 
+    ledflash();
+    enterDeepSleep();
 
 }
