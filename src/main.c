@@ -38,7 +38,7 @@
 
 #define WIFI_SSID      "Tufts_Wireless"
 #define WIFI_PASS      ""
-#define BROKER_URI "mqtt://bell-mqtt.eecs.tufts.edu"
+#define BROKER_URI "mqtt://bell-mqtt.eecs.tufts.edu/"
 
 
 static i2c_master_bus_handle_t bus;
@@ -54,13 +54,51 @@ static void init_adc(void) {
     adc1_config_channel_atten(NTC_ADC_CH, ADC_ATTEN_DB_11); // up to ~3.3V
 }
 
-static void mqttinit(){
+static const char *MQTT_TAG = "MQTT";
+static bool mqtt_connected = false;
+static bool mqtt_published = false;
+
+static void mqtt_event_handler(void *handler_args,
+                               esp_event_base_t base,
+                               int32_t event_id,
+                               void *event_data)
+{
+    esp_mqtt_event_handle_t event = event_data;
+
+    switch (event_id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(MQTT_TAG, "MQTT connected");
+        mqtt_connected = true;
+        break;
+
+    case MQTT_EVENT_PUBLISHED:
+        ESP_LOGI(MQTT_TAG, "MQTT message published, msg_id=%d", event->msg_id);
+        mqtt_published = true;
+        break;
+
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGI(MQTT_TAG, "MQTT disconnected");
+        mqtt_connected = false;
+        break;
+
+    default:
+        break;
+    }
+}
+
+static void mqttinit(void)
+{
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = BROKER_URI,
     };
     client = esp_mqtt_client_init(&mqtt_cfg);
+
+    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID,
+                                   mqtt_event_handler, NULL);
+
     esp_mqtt_client_start(client);
 }
+
 
 //to do
 static void publishmqtt(float temp, float battery, float rrsi){
@@ -145,26 +183,13 @@ void nvsinit(){
 }
 
 void wifiinit(){
+    uint8_t mac[6]; 
+    esp_read_mac(mac, ESP_MAC_TYPE_WIFI_STA);
+
+
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_connect(WIFI_SSID, WIFI_PASS);
 }
-
-static void init_sntp(void)
-{
-    static bool sntp_initialized = false;
-    if (sntp_initialized) {
-        ESP_LOGI("NTP", "SNTP already initialized, skip");
-        return;
-    }
-    sntp_initialized = true;
-
-    ESP_LOGI("NTP", "Initializing SNTP");
-
-    sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, "pool.ntp.org");
-    sntp_init();
-}
-
 
 void ledinit(){
     // Configure pin as output
@@ -186,12 +211,11 @@ void ledflash(void)
 
 uint64_t get_epoch_time(void)
 {
-    // Initialize SNTP only once
-    static bool sntp_initialized = false;
-    if (!sntp_initialized) {
-        init_sntp();
-        sntp_initialized = true;
-    }
+    ESP_LOGI("NTP", "Initializing SNTP");
+
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");
+    sntp_init();
 
     // Wait for time to be set
     int retry = 0;
@@ -217,11 +241,11 @@ uint64_t get_epoch_time(void)
 }
 
 
-void enterDeepSleep(){
+void enterDeepSleep(long long interval){
     ESP_LOGI("SLEEP", "Device is going to sleep for 10 second...");
 
     // 1 hour = 3600 seconds
-    const int64_t sleep_time_us = 10LL * 1000000LL;
+    const int64_t sleep_time_us = interval * 1000000LL;
 
     // Configure wakeup source: timer
     esp_sleep_enable_timer_wakeup(sleep_time_us);
@@ -280,15 +304,44 @@ void app_main(void)
     ledinit();
     i2cinit();
     wifiinit();
-    init_sntp();
+
     uint64_t epoch = get_epoch_time();
     printf("Epoch = %llu\n", (unsigned long long)epoch);
+
     mqttinit();
+
+
+    int retry = 0;
+    // Wait until MQTT connected
+    while (!mqtt_connected) {
+        ESP_LOGI(MQTT_TAG, "Waiting for MQTT connection...");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        retry++;
+        if(retry > 15){
+            enterDeepSleep(600);
+        }
+    }
+
     float t_ic = get_temp_ic();
-    printf("temperature is: %6.2f °C", t_ic);
     float batt_vol = readvoltage();
-    printf("Battery percentage is is: %6.2f", batt_vol);
-    mqttsend("teamK/node0/update", build_json(epoch, t_ic, get_rssi(), batt_vol));
+    int rssi = get_rssi();
+
+    char *json = build_json(epoch, t_ic, rssi, batt_vol);
+    if (!json) {
+        ESP_LOGE(MQTT_TAG, "Failed to allocate JSON buffer");
+        enterDeepSleep(600);
+        return;
+    }
+
+    int msg_id = esp_mqtt_client_publish(client, "teamK/node0/update",
+                                         json, 0, 1, 0);
+    ESP_LOGI(MQTT_TAG, "Publish msg_id=%d", msg_id);
+
+    free(json);  // avoid leak
+
+    // Optionally wait for MQTT_EVENT_PUBLISHED for this msg_id
+    vTaskDelay(pdMS_TO_TICKS(2000));  // simple delay is OK for class project
+
     ledflash();
-    enterDeepSleep();
+    enterDeepSleep(3600);
 }
