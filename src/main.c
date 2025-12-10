@@ -15,6 +15,7 @@
 #include <math.h>  
 #include "esp_sntp.h"
 #include <time.h>
+#include "esp_mac.h"
 
 
 // Configure the WiFi network settings here
@@ -183,10 +184,12 @@ void nvsinit(){
 }
 
 void wifiinit(){
-    uint8_t mac[6]; 
-    esp_read_mac(mac, ESP_MAC_TYPE_WIFI_STA);
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    ESP_LOGI("MAC is !!!!:   ", "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-
+    
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_connect(WIFI_SSID, WIFI_PASS);
 }
@@ -276,20 +279,28 @@ char *build_json(uint64_t epoch, float tempval, int rssi, float batt_val)
     char *json = malloc(256);   // 256 bytes is plenty for this structure
     if (!json) return NULL;
 
-    snprintf(json, 256,
-        "{"
+snprintf(json, 512,
+    "{"
         "\"measurements\": ["
-            "[%llu, %.2f],"
-            "[%llu, %d],"
             "[%llu, %.2f]"
         "],"
-        "\"board_time\": %llu"
-        "}",
-        (unsigned long long)epoch, tempval,
-        (unsigned long long)epoch, rssi,
-        (unsigned long long)epoch, batt_val,
-        (unsigned long long)epoch
-    );
+        "\"board_time\": %llu,"
+        "\"heartbeat\": {"
+            "\"Status\": 0,"
+            "\"battery_percent\": %.2f,"
+            "\"rssi\": %d,"
+            "\"text\": ["
+                "\"error: no wifi :(\","
+                "\"imagine this string was a descriptive error message\""
+            "]"
+        "}"
+    "}",
+    (unsigned long long)epoch, tempval,
+    (unsigned long long)epoch,
+    batt_val,
+    rssi
+);
+
 
     return json;
 }
@@ -331,6 +342,8 @@ void app_main(void)
         ESP_LOGE(MQTT_TAG, "Failed to allocate JSON buffer");
         enterDeepSleep(600);
         return;
+    }else{
+       ESP_LOGI("JSON", "%s", json);
     }
 
     int msg_id = esp_mqtt_client_publish(client, "teamK/node0/update",
