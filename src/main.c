@@ -160,7 +160,7 @@ static float get_temp_ic(void)
     esp_err_t e = i2c_master_transmit_receive(dev, &ptr, 1, rx, 2, 300);
     if (e != ESP_OK) {
         ESP_LOGE("TMP1075", "I2C read failed: %s", esp_err_to_name(e));
-        return NAN;   // or -999.9f
+        return 0;   // or -999.9f
     }
 
     // 2) Convert to 12-bit two's complement
@@ -282,11 +282,11 @@ char *build_json(uint64_t epoch, float tempval, int rssi, float batt_val)
 snprintf(json, 512,
     "{"
         "\"measurements\": ["
-            "[%llu, %.2f]"
+            "%llu, %.2f, %d"
         "],"
         "\"board_time\": %llu,"
         "\"heartbeat\": {"
-            "\"Status\": 0,"
+            "\"status\": 0,"
             "\"battery_percent\": %.2f,"
             "\"rssi\": %d,"
             "\"text\": ["
@@ -295,7 +295,7 @@ snprintf(json, 512,
             "]"
         "}"
     "}",
-    (unsigned long long)epoch, tempval,
+    (unsigned long long)epoch, tempval, rssi,
     (unsigned long long)epoch,
     batt_val,
     rssi
