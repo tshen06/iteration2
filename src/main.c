@@ -151,12 +151,20 @@ void wifiinit(){
 
 static void init_sntp(void)
 {
+    static bool sntp_initialized = false;
+    if (sntp_initialized) {
+        ESP_LOGI("NTP", "SNTP already initialized, skip");
+        return;
+    }
+    sntp_initialized = true;
+
     ESP_LOGI("NTP", "Initializing SNTP");
 
     sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, "pool.ntp.org");  // You can add more servers if needed
+    sntp_setservername(0, "pool.ntp.org");
     sntp_init();
 }
+
 
 void ledinit(){
     // Configure pin as output
@@ -225,7 +233,42 @@ void enterDeepSleep(){
     esp_deep_sleep_start();
 }
 
+int get_rssi(void)
+{
+    wifi_ap_record_t ap_info;
 
+    // Must be connected to WiFi before calling this
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        return ap_info.rssi;   // RSSI is in dBm (negative number)
+    } else {
+        ESP_LOGE("RSSI", "Failed to get AP info");
+        return 0; // or some default
+    }
+}
+
+char *build_json(uint64_t epoch, float tempval, int rssi, float batt_val)
+{
+    // Allocate enough memory for the JSON string
+    char *json = malloc(256);   // 256 bytes is plenty for this structure
+    if (!json) return NULL;
+
+    snprintf(json, 256,
+        "{"
+        "\"measurements\": ["
+            "[%llu, %.2f],"
+            "[%llu, %d],"
+            "[%llu, %.2f]"
+        "],"
+        "\"board_time\": %llu"
+        "}",
+        (unsigned long long)epoch, tempval,
+        (unsigned long long)epoch, rssi,
+        (unsigned long long)epoch, batt_val,
+        (unsigned long long)epoch
+    );
+
+    return json;
+}
 void mqttsend(char* topic, char* data){
     esp_mqtt_client_publish(client, topic, data, 0, 1, 0);
 }
@@ -245,8 +288,7 @@ void app_main(void)
     printf("temperature is: %6.2f °C", t_ic);
     float batt_vol = readvoltage();
     printf("Battery percentage is is: %6.2f", batt_vol);
-
-    
+    mqttsend("teamK/node0/update", build_json(epoch, t_ic, get_rssi(), batt_vol));
     ledflash();
     enterDeepSleep();
 }
