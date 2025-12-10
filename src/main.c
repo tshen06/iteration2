@@ -13,6 +13,10 @@
 #include "mqtt_client.h"
 #include "esp_sleep.h"
 #include <math.h>  
+#include "esp_sntp.h"
+#include <time.h>
+
+
 // Configure the WiFi network settings here
 
 
@@ -29,7 +33,7 @@
 #define SDA_PIN 5
 #define SCL_PIN 4
 #define LED_GPIO 1
-#define NTC_ADC_CH          ADC_CHANNEL_0
+#define NTC_ADC_CH          ADC_CHANNEL_3
 
 
 #define WIFI_SSID      "Tufts_Wireless"
@@ -63,15 +67,27 @@ static void publishmqtt(float temp, float battery, float rrsi){
     //esp_mqtt_client_publish(client, "tshen06/iteration1/thermistor_temp", t_ntc_buffer, 0, 0, 0);
 }
 
+#define R1 330000.0f   // top resistor (Vbat -> ADC)
+#define R2 110000.0f   // bottom resistor (ADC -> GND)
+
+
 float readvoltage(void) {
     int acc = 0;
     for (int i = 0; i < ADC_SAMPLES; i++) {
-        acc += adc1_get_raw(NTC_ADC_CH);
+        acc += adc1_get_raw(NTC_ADC_CH);   // ADC_CHANNEL_3 for GPIO3
     }
+
     float raw = (float)acc / (float)ADC_SAMPLES;
-    float v = (raw / 4095.0f) * ADC_VREF;
-    return v;
+
+    // ADC voltage at GPIO3
+    float v_adc = (raw / 4095.0f) * ADC_VREF;   // ADC_VREF = 3.3f
+
+    // Battery voltage (undo the divider)
+    float v_bat = v_adc * ((R1 + R2) / R2);     // here this is v_adc * 4.0f
+
+    return v_bat;
 }
+
 
 void i2cinit(void)
 {
@@ -132,6 +148,16 @@ void wifiinit(){
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_connect(WIFI_SSID, WIFI_PASS);
 }
+
+static void init_sntp(void)
+{
+    ESP_LOGI("NTP", "Initializing SNTP");
+
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");  // You can add more servers if needed
+    sntp_init();
+}
+
 void ledinit(){
     // Configure pin as output
     gpio_reset_pin(LED_GPIO);
@@ -150,6 +176,39 @@ void ledflash(void)
     }
 }
 
+uint64_t get_epoch_time(void)
+{
+    // Initialize SNTP only once
+    static bool sntp_initialized = false;
+    if (!sntp_initialized) {
+        init_sntp();
+        sntp_initialized = true;
+    }
+
+    // Wait for time to be set
+    int retry = 0;
+    const int retry_count = 15;
+
+    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && retry < retry_count) {
+        ESP_LOGI("NTP", "Waiting for system time... (%d/%d)", retry+1, retry_count);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        retry++;
+    }
+
+    // Get current system time
+    time_t now;
+    time(&now);
+
+    if (now < 100000) {
+        ESP_LOGE("NTP", "Failed to get time from NTP!");
+        return 0;  // 0 = failed
+    }
+
+    ESP_LOGI("NTP", "Epoch time: %lld", (long long)now);
+    return (uint64_t)now;
+}
+
+
 void enterDeepSleep(){
     ESP_LOGI("SLEEP", "Device is going to sleep for 10 second...");
 
@@ -166,6 +225,11 @@ void enterDeepSleep(){
     esp_deep_sleep_start();
 }
 
+
+void mqttsend(char* topic, char* data){
+    esp_mqtt_client_publish(client, topic, data, 0, 1, 0);
+}
+
 void app_main(void)
 {
     nvsinit();
@@ -173,12 +237,16 @@ void app_main(void)
     ledinit();
     i2cinit();
     wifiinit();
+    init_sntp();
+    uint64_t epoch = get_epoch_time();
+    printf("Epoch = %llu\n", (unsigned long long)epoch);
     mqttinit();
     float t_ic = get_temp_ic();
     printf("temperature is: %6.2f °C", t_ic);
     float batt_vol = readvoltage();
-    printf("Battery percentage is is: %6.2f", batt_vol); 
+    printf("Battery percentage is is: %6.2f", batt_vol);
+
+    
     ledflash();
     enterDeepSleep();
-
 }
