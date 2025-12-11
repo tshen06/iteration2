@@ -38,8 +38,13 @@
 // Sleep interval in seconds (1 hour)
 #define SLEEP_INTERVAL_S 3600 
 #define MAX_MQTT_RETRY 10 // Max retry for MQTT connection
+#include "freertos/event_groups.h" // Important: include the type definition
 
+// Add this extern declaration:
+extern EventGroupHandle_t s_wifi_event_group; 
 
+// Keep the function prototype:
+esp_err_t wifi_connect(const char* ssid, const char* pass);
 // --- 2. GLOBAL STATE & ERROR FLAGS ---
 typedef enum {
     STATUS_OK = 0,
@@ -117,6 +122,7 @@ static float get_temp_ic(void)
     return temp_c;
 }
 
+
 float readvoltage(void) {
     int acc = 0;
     for (int i = 0; i < ADC_SAMPLES; i++) {
@@ -125,7 +131,9 @@ float readvoltage(void) {
     float raw = (float)acc / (float)ADC_SAMPLES;
     float v_adc = (raw / 4095.0f) * ADC_VREF;
     float v_bat = v_adc * ((R1 + R2) / R2);
-    return v_bat;
+
+    ESP_LOGI("Bat", "Battery raw is %.2f", v_bat);
+    return v_bat / 4.2;
 }
 
 #define BATTERY_MAX_VOLTAGE 4.20f // 100% full charge
@@ -185,30 +193,34 @@ uint64_t get_epoch_time(void)
     int retry = 0;
     const int retry_count = 15;
 
-    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && retry < retry_count) {
-        ESP_LOGI("NTP", "Waiting for system time... (%d/%d)", retry+1, retry_count);
+    // --- MODIFIED CONDITION HERE ---
+    while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED && retry < retry_count) {
+        // Log the current status to help debug why it might be failing
+        ESP_LOGI("NTP", "Waiting for system time... (Current Status: %d) (%d/%d)", 
+                 sntp_get_sync_status(), retry+1, retry_count);
+        
         vTaskDelay(pdMS_TO_TICKS(1000));
         retry++;
     }
-
+    // -------------------------------
+    
     time_t now;
     time(&now);
-
-    if (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED) {
-        ESP_LOGE("NTP", "Failed to get time from NTP!");
-        system_status = STATUS_NTP_FAIL;
-        return 0; 
-    }
-
-    ESP_LOGI("NTP", "Epoch time: %lld", (long long)now);
     return (uint64_t)now;
 }
-
 void wifiinit(){
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
+
+    // *** CRITICAL ADDITION: INITIALIZE THE EVENT GROUP ***
+    s_wifi_event_group = xEventGroupCreate();
+    if (s_wifi_event_group == NULL) {
+        ESP_LOGE(TAG, "Failed to create WiFi event group!");
+        system_status = STATUS_WIFI_FAIL;
+        return; 
+    }
     
     // 检查新的返回值
-    if (wifi_connect(WIFI_SSID, WIFI_PASS) == ESP_OK) { // <-- 现在可以进行比较
+    if (wifi_connect(WIFI_SSID, WIFI_PASS) == ESP_OK) { // <-- Now this will not crash
         wifi_connected = true;
     } else {
         ESP_LOGE(TAG, "WiFi connection FAILED!");
@@ -320,23 +332,31 @@ char *build_json(uint64_t epoch, float tempval, int rssi, float batt_vol, int st
     if (!json) return NULL;
 
     const char* status_text = get_status_message(status_code); 
+
+    if(status_code == 0) {}
+    else if(status_code == 1 || status_code == 2 || status_code == 4){
+        status_code = 1;
+    }else{
+        status_code = 2;
+    }
+
     float batt_percent = voltage_to_percentage(batt_vol);
     
     // --- 修正后的 snprintf ---
     snprintf(json, 300,
     "{"
         "\"measurements\": ["
-            "{\"epoch\": %llu, \"temp\": %.2f, \"rssi\": %d}" 
+            "[%llu, %.2f],[%llu, %d],[%llu, %.2f]" 
         "],"
         "\"board_time\": %llu,"
         "\"heartbeat\": {"
             "\"status\": %d," 
             "\"battery_percent\": %.2f,"
-            "\"rssi\": %d,"             // <-- 注意：这里需要逗号
-            "\"text\": [\"%s\"]"         // <-- 这里是 %s 的占位符
+            "\"rssi\": %d,"            
+            "\"text\": [\"%s\"]"        
         "}"
     "}",
-    (unsigned long long)epoch, tempval, rssi, // measurements (3 arguments)
+    (unsigned long long)epoch, tempval, epoch, rssi, epoch, batt_percent,// measurements (3 arguments)
     (unsigned long long)epoch,                 // board_time (1 argument)
     status_code,                               // status (1 argument)
     batt_percent,                              // battery_percent (1 argument)

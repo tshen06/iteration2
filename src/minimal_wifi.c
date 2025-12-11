@@ -25,17 +25,17 @@
 
 // FreeRTOS event group to signal when we are connected.
 // This allows the callback function to communicate back to the main WiFi setup routine
-static EventGroupHandle_t s_wifi_event_group;
-
+EventGroupHandle_t s_wifi_event_group;
 // The event group allows multiple bits for each event, but we only care about two events:
 // 0) we are connected to the AP with an IP
 // 1) we failed to connect after the maximum amount of retries
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-static const char *TAG = "wifi station";
+static const char *TAG = "Iteration 2, Group 1";
 
 static int s_retry_num = 0;
+
 
 /* Callback for handling all WiFi events.  This could be broken out into
  * separate functions for each of the events, but it doesn't really matter. */

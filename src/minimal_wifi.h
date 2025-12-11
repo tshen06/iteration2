@@ -1,1 +1,1 @@
-esp_err_t wifi_connect(const char* ssid, const char* pass)；
+esp_err_t wifi_connect(const char* ssid, const char* pass);
