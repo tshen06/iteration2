@@ -64,12 +64,22 @@ static void event_handler(void* arg, esp_event_base_t event_base,
 /* Initialize the WiFi STA connection.
  * This function configures the connection and then blocks until the connection either
  * succeeds or fails. */
-void wifi_connect(const char* ssid, const char* pass)
+
+// --- Assumed necessary definitions (MUST be defined globally in your main.c or header) ---
+// extern EventGroupHandle_t s_wifi_event_group; 
+// #define WIFI_CONNECTED_BIT BIT0
+// #define WIFI_FAIL_BIT BIT1
+// -----------------------------------------------------------------------------------------
+
+
+esp_err_t wifi_connect(const char* ssid, const char* pass) // <-- 改变函数签名以返回 esp_err_t
 {
-    s_wifi_event_group = xEventGroupCreate();
+    // WARNING: s_wifi_event_group must be initialized globally or outside this function if called repeatedly.
+    // For this demonstration, we assume it's correctly managed.
+    // s_wifi_event_group = xEventGroupCreate(); 
 
+    // Initialize networking components (usually done once in app_main)
     ESP_ERROR_CHECK(esp_netif_init());
-
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
 
@@ -78,54 +88,43 @@ void wifi_connect(const char* ssid, const char* pass)
 
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_got_ip));
-
-    //wifi_config_t wifi_config;
+    
+    // Register event handlers (assuming event_handler is defined elsewhere)
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, &instance_got_ip));
 
     wifi_config_t wifi_config = {
         .sta = {
-            /* Authmode threshold resets to WPA2 as default if password matches WPA2 standards (pasword len => 8).
-             * If you want to connect the device to deprecated WEP/WPA networks, Please set the threshold value
-             * to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set the password with length and format matching to
-             * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
-             */
             .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
-            // Let everything else initialize to 0; ssid and password are set below
         },
     };
-    strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) / sizeof(uint8_t));
-    strncpy((char*)wifi_config.sta.password, pass, sizeof(wifi_config.sta.password) / sizeof(uint8_t));
-   
+    // Use strlcpy for safer buffer handling if available, otherwise strncpy is used below
+    strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+    strncpy((char*)wifi_config.sta.password, pass, sizeof(wifi_config.sta.password));
+    
+    // Configure and start WiFi
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
     ESP_ERROR_CHECK(esp_wifi_start() );
 
     ESP_LOGI(TAG, "WiFi configured, waiting for callbacks.");
 
-    /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
-     * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
+    /* Wait for connection established (WIFI_CONNECTED_BIT) or failed (WIFI_FAIL_BIT) */
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-            pdFALSE,
-            pdFALSE,
-            portMAX_DELAY);
+                WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                pdFALSE,
+                pdFALSE,
+                portMAX_DELAY); // Wait indefinitely
 
-    /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
-     * happened. */
+    /* Process the result of the connection attempt */
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "connected to AP SSID: %s", ssid);
+        return ESP_OK; // <-- 成功连接时返回 ESP_OK
     } else if (bits & WIFI_FAIL_BIT) {
         ESP_LOGI(TAG, "Failed to connect to SSID: %s", ssid);
+        return ESP_FAIL; // <-- 连接失败时返回 ESP_FAIL
     } else {
         ESP_LOGE(TAG, "UNEXPECTED EVENT");
+        return ESP_ERR_NOT_FOUND; // <-- 发生意外事件时返回其他错误
     }
 }

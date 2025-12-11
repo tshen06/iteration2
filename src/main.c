@@ -4,84 +4,258 @@
 #include <esp_err.h>
 #include "esp_log.h"
 #include "nvs_flash.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "esp_wifi.h"
 #include "minimal_wifi.h"
 #include "driver/gpio.h"
 #include "driver/adc.h"
 #include "mqtt_client.h"
 #include "esp_sleep.h"
-#include <math.h>  
+#include <math.h>
 #include "esp_sntp.h"
 #include <time.h>
 #include "esp_mac.h"
+#include <string.h>
 
-
-// Configure the WiFi network settings here
-
-
+// --- 1. CONFIGURATION ---
 #define I2C_PORT I2C_NUM_0
 #define I2C_FREQ_HZ 100000
-#define TMP1075_ADDR  0x48
-#define CMD_MSB 0x24
-#define CMD_LSB 0x16
+#define TMP1075_ADDR 0x48
 #define MEAS_DELAY_MS 25
 
-#define ADC_VREF            3.3f
-#define ADC_SAMPLES         32
-
+#define ADC_VREF 3.3f
+#define ADC_SAMPLES 32
 #define SDA_PIN 5
 #define SCL_PIN 4
-#define LED_GPIO 1
-#define NTC_ADC_CH          ADC_CHANNEL_3
+#define LED_GPIO 1 // Re-enabled LED GPIO
+#define NTC_ADC_CH  ADC_CHANNEL_3 // Assuming GPIO3
+#define R1 330000.0f // top resistor (Vbat -> ADC)
+#define R2 110000.0f // bottom resistor (ADC -> GND)
 
-
-#define WIFI_SSID      "Tufts_Wireless"
-#define WIFI_PASS      ""
+#define WIFI_SSID "Tufts_Wireless"
+#define WIFI_PASS ""
 #define BROKER_URI "mqtt://bell-mqtt.eecs.tufts.edu/"
+
+// Sleep interval in seconds (1 hour)
+#define SLEEP_INTERVAL_S 3600 
+#define MAX_MQTT_RETRY 10 // Max retry for MQTT connection
+
+
+// --- 2. GLOBAL STATE & ERROR FLAGS ---
+typedef enum {
+    STATUS_OK = 0,
+    STATUS_WIFI_FAIL = 1,
+    STATUS_MQTT_FAIL = 2,
+    STATUS_I2C_FAIL = 3,
+    STATUS_NTP_FAIL = 4,
+} system_status_t;
+
+static system_status_t system_status = STATUS_OK; 
 
 
 static i2c_master_bus_handle_t bus;
 static i2c_master_dev_handle_t dev;
 
 static const char *TAG = "Iteration 2, Group 1";
+static const char *MQTT_TAG = "MQTT";
 
 esp_mqtt_client_handle_t client;
+static bool mqtt_connected = false;
+static bool wifi_connected = false;
+static bool mqtt_published = false; // Flag to track successful publish
 
+
+// --- 3. HELPER FUNCTIONS ---
 
 static void init_adc(void) {
     adc1_config_width(ADC_WIDTH_BIT_12);
-    adc1_config_channel_atten(NTC_ADC_CH, ADC_ATTEN_DB_11); // up to ~3.3V
+    adc1_config_channel_atten(NTC_ADC_CH, ADC_ATTEN_DB_11);
 }
 
-static const char *MQTT_TAG = "MQTT";
-static bool mqtt_connected = false;
-static bool mqtt_published = false;
+void i2cinit(void)
+{
+    i2c_master_bus_config_t b = {
+        .i2c_port = I2C_PORT,
+        .scl_io_num = SCL_PIN,
+        .sda_io_num = SDA_PIN,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .flags = {.enable_internal_pullup = 1}, 
+    };
+    if (ESP_OK != i2c_new_master_bus(&b, &bus)) {
+        ESP_LOGE(TAG, "I2C Bus Init FAILED");
+        system_status = STATUS_I2C_FAIL;
+        return;
+    }
 
+    i2c_device_config_t d = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = TMP1075_ADDR,
+        .scl_speed_hz = I2C_FREQ_HZ,
+    };
+    if (ESP_OK != i2c_master_bus_add_device(bus, &d, &dev)) {
+        ESP_LOGE(TAG, "I2C Device Add FAILED");
+        system_status = STATUS_I2C_FAIL;
+    }
+}
+
+static float get_temp_ic(void)
+{
+    if (system_status == STATUS_I2C_FAIL) return -999.9f;
+
+    uint8_t ptr = 0x00;
+    uint8_t rx[2] = {0};
+
+    esp_err_t e = i2c_master_transmit_receive(dev, &ptr, 1, rx, 2, 300);
+    if (e != ESP_OK) {
+        ESP_LOGE("TMP1075", "I2C read failed: %s", esp_err_to_name(e));
+        system_status = STATUS_I2C_FAIL;
+        return -999.9;
+    }
+
+    int16_t raw = ((int16_t)rx[0] << 8) | rx[1];
+    raw >>= 4;
+    float temp_c = (float)raw * 0.0625f;
+    return temp_c;
+}
+
+float readvoltage(void) {
+    int acc = 0;
+    for (int i = 0; i < ADC_SAMPLES; i++) {
+        acc += adc1_get_raw(NTC_ADC_CH);
+    }
+    float raw = (float)acc / (float)ADC_SAMPLES;
+    float v_adc = (raw / 4095.0f) * ADC_VREF;
+    float v_bat = v_adc * ((R1 + R2) / R2);
+    return v_bat;
+}
+
+#define BATTERY_MAX_VOLTAGE 4.20f // 100% full charge
+#define BATTERY_MIN_VOLTAGE 3.00f // 0% discharged (cutoff voltage)
+
+/**
+ * @brief Converts the measured battery voltage (Vbat) to a percentage (0-100%).
+ * * Uses linear interpolation based on defined MAX and MIN voltage boundaries.
+ * * @param vbat_voltage The battery voltage read by the ADC function.
+ * @return float The battery percentage (0.0f to 100.0f).
+ */
+float voltage_to_percentage(float vbat_voltage) {
+    
+    // 1. Boundary Check (Clamp the voltage)
+    
+    // If voltage is above MAX, it's 100%
+    if (vbat_voltage >= BATTERY_MAX_VOLTAGE) {
+        return 100.0f;
+    }
+    
+    // If voltage is below MIN, it's 0%
+    if (vbat_voltage <= BATTERY_MIN_VOLTAGE) {
+        return 0.0f;
+    }
+
+    // 2. Linear Interpolation Calculation
+    
+    // Calculate the range of voltages used for 0% to 100%
+    float voltage_range = BATTERY_MAX_VOLTAGE - BATTERY_MIN_VOLTAGE;
+    
+    // Calculate the voltage above the minimum threshold
+    float voltage_above_min = vbat_voltage - BATTERY_MIN_VOLTAGE;
+    
+    // Calculate percentage (scale the result to 0-100)
+    float percentage = (voltage_above_min / voltage_range) * 100.0f;
+
+    // Return the calculated percentage
+    return percentage;
+}
+
+// Example usage in your app_main (assuming you call readvoltage() first):
+/*
+    float batt_vol = readvoltage();
+    float batt_percent = voltage_to_percentage(batt_vol); // <-- New line
+    
+    // Pass batt_percent to the build_json function
+    char *json = build_json(epoch, t_ic, rssi, batt_vol, batt_percent, system_status);
+*/
+
+uint64_t get_epoch_time(void)
+{
+    ESP_LOGI("NTP", "Initializing SNTP");
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");
+    sntp_init();
+
+    int retry = 0;
+    const int retry_count = 15;
+
+    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && retry < retry_count) {
+        ESP_LOGI("NTP", "Waiting for system time... (%d/%d)", retry+1, retry_count);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        retry++;
+    }
+
+    time_t now;
+    time(&now);
+
+    if (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED) {
+        ESP_LOGE("NTP", "Failed to get time from NTP!");
+        system_status = STATUS_NTP_FAIL;
+        return 0; 
+    }
+
+    ESP_LOGI("NTP", "Epoch time: %lld", (long long)now);
+    return (uint64_t)now;
+}
+
+void wifiinit(){
+    ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
+    
+    // 检查新的返回值
+    if (wifi_connect(WIFI_SSID, WIFI_PASS) == ESP_OK) { // <-- 现在可以进行比较
+        wifi_connected = true;
+    } else {
+        ESP_LOGE(TAG, "WiFi connection FAILED!");
+        system_status = STATUS_WIFI_FAIL;
+    }
+}
+
+void ledinit(){
+     // Configure pin as output
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_GPIO, 1); // LED OFF (assuming active low or pulling high)
+}
+
+void ledflash(void)
+{
+    // Simplified flash for success indication
+    for (int i=0; i<3; i++){ // Flash 3 times
+        gpio_set_level(LED_GPIO, 0); // LED ON
+        vTaskDelay(pdMS_TO_TICKS(100));
+        gpio_set_level(LED_GPIO, 1); // LED OFF
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+
+// --- MQTT Event Handler and Init ---
 static void mqtt_event_handler(void *handler_args,
                                esp_event_base_t base,
                                int32_t event_id,
                                void *event_data)
 {
     esp_mqtt_event_handle_t event = event_data;
-
     switch (event_id) {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(MQTT_TAG, "MQTT connected");
         mqtt_connected = true;
         break;
-
     case MQTT_EVENT_PUBLISHED:
         ESP_LOGI(MQTT_TAG, "MQTT message published, msg_id=%d", event->msg_id);
-        mqtt_published = true;
+        mqtt_published = true; // <-- Set flag on successful publish
         break;
-
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(MQTT_TAG, "MQTT disconnected");
         mqtt_connected = false;
+        system_status = STATUS_MQTT_FAIL;
         break;
-
     default:
         break;
     }
@@ -89,6 +263,11 @@ static void mqtt_event_handler(void *handler_args,
 
 static void mqttinit(void)
 {
+    if (!wifi_connected) {
+        ESP_LOGW(MQTT_TAG, "Skipping MQTT init because WiFi is down.");
+        return;
+    }
+    
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = BROKER_URI,
     };
@@ -100,261 +279,152 @@ static void mqttinit(void)
     esp_mqtt_client_start(client);
 }
 
-
-//to do
-static void publishmqtt(float temp, float battery, float rrsi){
-    //esp_mqtt_client_publish(client, "tshen06/iteration1/thermistor_temp", t_ntc_buffer, 0, 0, 0);
-}
-
-#define R1 330000.0f   // top resistor (Vbat -> ADC)
-#define R2 110000.0f   // bottom resistor (ADC -> GND)
-
-
-float readvoltage(void) {
-    int acc = 0;
-    for (int i = 0; i < ADC_SAMPLES; i++) {
-        acc += adc1_get_raw(NTC_ADC_CH);   // ADC_CHANNEL_3 for GPIO3
-    }
-
-    float raw = (float)acc / (float)ADC_SAMPLES;
-
-    // ADC voltage at GPIO3
-    float v_adc = (raw / 4095.0f) * ADC_VREF;   // ADC_VREF = 3.3f
-
-    // Battery voltage (undo the divider)
-    float v_bat = v_adc * ((R1 + R2) / R2);     // here this is v_adc * 4.0f
-
-    return v_bat;
-}
-
-
-void i2cinit(void)
-{
-    i2c_master_bus_config_t b = {
-        .i2c_port = I2C_PORT,
-        .scl_io_num = SCL_PIN,
-        .sda_io_num = SDA_PIN,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .flags = {.enable_internal_pullup = 1},   // still OK, but add externals on PCB
-    };
-    ESP_ERROR_CHECK(i2c_new_master_bus(&b, &bus));
-
-    i2c_device_config_t d = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = TMP1075_ADDR,
-        .scl_speed_hz = I2C_FREQ_HZ,
-    };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &d, &dev));
-}
-
-
-
-
-static float get_temp_ic(void)
-{
-    // 1) Pointer to temperature register (0x00)
-    uint8_t ptr = 0x00;
-    uint8_t rx[2] = {0};
-
-    // Combined write-then-read: [ADDR+W][0x00] + repeated START + [ADDR+R][2 bytes]
-    esp_err_t e = i2c_master_transmit_receive(dev, &ptr, 1, rx, 2, 300);
-    if (e != ESP_OK) {
-        ESP_LOGE("TMP1075", "I2C read failed: %s", esp_err_to_name(e));
-        return 0;   // or -999.9f
-    }
-
-    // 2) Convert to 12-bit two's complement
-    int16_t raw = ((int16_t)rx[0] << 8) | rx[1];
-    raw >>= 4;  // top 12 bits are temperature
-
-    // 3) Each LSB = 0.0625°C
-    float temp_c = (float)raw * 0.0625f;
-    return temp_c;
-}
-
-
-void nvsinit(){
-    ESP_LOGI(TAG, "STARTING APPLICATION");
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-      ESP_ERROR_CHECK(nvs_flash_erase());
-      ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-}
-
-void wifiinit(){
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    ESP_LOGI("MAC is !!!!:   ", "%02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-
-    
-    ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
-    wifi_connect(WIFI_SSID, WIFI_PASS);
-}
-
-void ledinit(){
-    // Configure pin as output
-    gpio_reset_pin(LED_GPIO);
-    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(LED_GPIO, 1);
-}
-
-void ledflash(void)
-{
-    for (int i=0; i<5; i++){
-        gpio_set_level(LED_GPIO, 0);
-        printf("GPIO %d HIGH\n", LED_GPIO);
-        vTaskDelay(pdMS_TO_TICKS(300));
-        gpio_set_level(LED_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(300));
-    }
-}
-
-uint64_t get_epoch_time(void)
-{
-    ESP_LOGI("NTP", "Initializing SNTP");
-
-    sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, "pool.ntp.org");
-    sntp_init();
-
-    // Wait for time to be set
-    int retry = 0;
-    const int retry_count = 15;
-
-    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && retry < retry_count) {
-        ESP_LOGI("NTP", "Waiting for system time... (%d/%d)", retry+1, retry_count);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        retry++;
-    }
-
-    // Get current system time
-    time_t now;
-    time(&now);
-
-    if (now < 100000) {
-        ESP_LOGE("NTP", "Failed to get time from NTP!");
-        return 0;  // 0 = failed
-    }
-
-    ESP_LOGI("NTP", "Epoch time: %lld", (long long)now);
-    return (uint64_t)now;
-}
-
-
-void enterDeepSleep(long long interval){
-    ESP_LOGI("SLEEP", "Device is going to sleep for 10 second...");
-
-    // 1 hour = 3600 seconds
-    const int64_t sleep_time_us = interval * 1000000LL;
-
-    // Configure wakeup source: timer
-    esp_sleep_enable_timer_wakeup(sleep_time_us);
-
-    // Optional: flush logs
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    // Enter deep sleep
-    esp_deep_sleep_start();
-}
-
 int get_rssi(void)
 {
-    wifi_ap_record_t ap_info;
+    if (!wifi_connected) return 0;
 
-    // Must be connected to WiFi before calling this
+    wifi_ap_record_t ap_info;
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
-        return ap_info.rssi;   // RSSI is in dBm (negative number)
+        return ap_info.rssi;
     } else {
         ESP_LOGE("RSSI", "Failed to get AP info");
-        return 0; // or some default
+        return 0;
+    }
+}
+/**
+ * @brief Converts the global status code into a human-readable error/status message.
+ * @param status_code The integer status code (from system_status_t enum).
+ * @return const char* Pointer to the static status string.
+ */
+const char* get_status_message(int status_code) {
+    switch (status_code) {
+        case STATUS_OK:
+            return "SUCCESS: Data published.";
+        case STATUS_WIFI_FAIL:
+            return "ERROR: Failed to connect to WiFi.";
+        case STATUS_MQTT_FAIL:
+            return "ERROR: Failed to connect to MQTT broker.";
+        case STATUS_I2C_FAIL:
+            return "ERROR: I2C sensor (TMP1075) read failed.";
+        case STATUS_NTP_FAIL:
+            return "WARNING: Failed to synchronize time (NTP).";
+        default:
+            return "FATAL ERROR: Unknown status code.";
     }
 }
 
-char *build_json(uint64_t epoch, float tempval, int rssi, float batt_val)
+char *build_json(uint64_t epoch, float tempval, int rssi, float batt_vol, int status_code)
 {
     // Allocate enough memory for the JSON string
-    char *json = malloc(256);   // 256 bytes is plenty for this structure
+    char *json = malloc(300); 
     if (!json) return NULL;
 
-snprintf(json, 512,
+    const char* status_text = get_status_message(status_code); 
+    float batt_percent = voltage_to_percentage(batt_vol);
+    
+    // --- 修正后的 snprintf ---
+    snprintf(json, 300,
     "{"
         "\"measurements\": ["
-            "%llu, %.2f, %d"
+            "{\"epoch\": %llu, \"temp\": %.2f, \"rssi\": %d}" 
         "],"
         "\"board_time\": %llu,"
         "\"heartbeat\": {"
-            "\"status\": 0,"
+            "\"status\": %d," 
             "\"battery_percent\": %.2f,"
-            "\"rssi\": %d,"
-            "\"text\": ["
-                "\"error: no wifi :(\","
-                "\"imagine this string was a descriptive error message\""
-            "]"
+            "\"rssi\": %d,"             // <-- 注意：这里需要逗号
+            "\"text\": [\"%s\"]"         // <-- 这里是 %s 的占位符
         "}"
     "}",
-    (unsigned long long)epoch, tempval, rssi,
-    (unsigned long long)epoch,
-    batt_val,
-    rssi
-);
-
+    (unsigned long long)epoch, tempval, rssi, // measurements (3 arguments)
+    (unsigned long long)epoch,                 // board_time (1 argument)
+    status_code,                               // status (1 argument)
+    batt_percent,                              // battery_percent (1 argument)
+    rssi,                                      // rssi (1 argument)
+    status_text                                // text (1 argument)
+    ); // 8 arguments in total (3 + 1 + 1 + 1 + 1 + 1)
 
     return json;
 }
-void mqttsend(char* topic, char* data){
-    esp_mqtt_client_publish(client, topic, data, 0, 1, 0);
+
+void enterDeepSleep(long long interval){
+    ESP_LOGI("SLEEP", "Device is going to sleep for %lld second...", interval);
+
+    const int64_t sleep_time_us = interval * 1000000LL;
+    esp_sleep_enable_timer_wakeup(sleep_time_us);
+    
+    // Cleanup and flush logs before sleep
+    esp_log_level_set("*", ESP_LOG_NONE); 
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    esp_deep_sleep_start();
 }
+
+
+// --- 4. Main Application ---
 
 void app_main(void)
 {
-    nvsinit();
+    // --- Phase 1: Initialization ---
+    nvs_flash_init();
     init_adc();
-    ledinit();
-    i2cinit();
+    ledinit(); // Initialize LED pin
+    i2cinit(); 
+    
+    // --- Phase 2: Connection & Data Gathering ---
     wifiinit();
-
-    uint64_t epoch = get_epoch_time();
-    printf("Epoch = %llu\n", (unsigned long long)epoch);
-
+    
+    uint64_t epoch = 0;
+    if (wifi_connected) {
+        epoch = get_epoch_time();
+    }
+    
     mqttinit();
-
-
+    
+    // Wait for MQTT connection, but limited time
     int retry = 0;
-    // Wait until MQTT connected
-    while (!mqtt_connected) {
+    while (!mqtt_connected && retry < MAX_MQTT_RETRY && wifi_connected) {
         ESP_LOGI(MQTT_TAG, "Waiting for MQTT connection...");
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(200)); 
         retry++;
-        if(retry > 15){
-            enterDeepSleep(600);
-        }
+    }
+    if (!mqtt_connected && wifi_connected) { // Only set MQTT fail if WiFi was OK
+        system_status = STATUS_MQTT_FAIL;
     }
 
+    // --- Phase 3: Sensor Read & Publish ---
     float t_ic = get_temp_ic();
     float batt_vol = readvoltage();
     int rssi = get_rssi();
 
-    char *json = build_json(epoch, t_ic, rssi, batt_vol);
-    if (!json) {
-        ESP_LOGE(MQTT_TAG, "Failed to allocate JSON buffer");
-        enterDeepSleep(600);
-        return;
-    }else{
-       ESP_LOGI("JSON", "%s", json);
+    char *json = build_json(epoch, t_ic, rssi, batt_vol, system_status);
+    
+    if (json && mqtt_connected) {
+        ESP_LOGI("JSON", "%s", json);
+        
+        // Publish message
+        int msg_id = esp_mqtt_client_publish(client, "teamK/node0/update",
+                                              json, 0, 1, 0);
+        ESP_LOGI(MQTT_TAG, "Publish msg_id=%d", msg_id);
+
+        // Wait short time to allow MQTT event to be processed
+        vTaskDelay(pdMS_TO_TICKS(500)); 
+    } else {
+        ESP_LOGE(TAG, "Publish skipped. Status: %d", system_status);
     }
 
-    int msg_id = esp_mqtt_client_publish(client, "teamK/node0/update",
-                                         json, 0, 1, 0);
-    ESP_LOGI(MQTT_TAG, "Publish msg_id=%d", msg_id);
-
-    free(json);  // avoid leak
-
-    // Optionally wait for MQTT_EVENT_PUBLISHED for this msg_id
-    vTaskDelay(pdMS_TO_TICKS(2000));  // simple delay is OK for class project
-
-    ledflash();
-    enterDeepSleep(3600);
+    if (json) free(json);
+    
+    // Stop MQTT client gracefully
+    if (client) {
+        esp_mqtt_client_stop(client);
+    }
+    
+    // --- Phase 4: Conditional LED Flash and Deep Sleep ---
+    
+    if (mqtt_published) { // Check the flag set by MQTT_EVENT_PUBLISHED
+        ledflash(); // Flash LED on success
+    }
+    
+    enterDeepSleep(SLEEP_INTERVAL_S);
 }
