@@ -405,7 +405,7 @@ char *build_json(uint64_t epoch, float tempval, int rssi, float batt_vol, int st
     snprintf(json, 300,
     "{"
         "\"measurements\": ["
-            "[%llu, %.2f],[%llu, %d],[%llu, %.2f]" 
+            "[%llu, %.2f]" 
         "],"
         "\"board_time\": %llu,"
         "\"heartbeat\": {"
@@ -415,7 +415,7 @@ char *build_json(uint64_t epoch, float tempval, int rssi, float batt_vol, int st
             "\"text\": [\"%s\"]"        
         "}"
     "}",
-    (unsigned long long)epoch, tempval, epoch, rssi, epoch, batt_percent,// measurements (3 arguments)
+    (unsigned long long)epoch, tempval,// measurements (3 arguments)
     (unsigned long long)epoch,                 // board_time (1 argument)
     status_code,                               // status (1 argument)
     batt_percent,                              // battery_percent (1 argument)
