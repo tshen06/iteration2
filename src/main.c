@@ -4,6 +4,7 @@
 #include <esp_err.h>
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_wifi.h"
 #include "minimal_wifi.h"
 #include "driver/gpio.h"
@@ -28,8 +29,8 @@
 #define SCL_PIN 4
 #define LED_GPIO 1 // Re-enabled LED GPIO
 #define NTC_ADC_CH  ADC_CHANNEL_3 // Assuming GPIO3
-#define R1 330000.0f // top resistor (Vbat -> ADC)
-#define R2 110000.0f // bottom resistor (ADC -> GND)
+#define R2 330000.0f // top resistor (Vbat -> ADC)
+#define R1 110000.0f // bottom resistor (ADC -> GND)
 
 #define WIFI_SSID "Tufts_Wireless"
 #define WIFI_PASS ""
@@ -39,6 +40,11 @@
 #define SLEEP_INTERVAL_S 3600 
 #define MAX_MQTT_RETRY 10 // Max retry for MQTT connection
 #include "freertos/event_groups.h" // Important: include the type definition
+
+
+#define NVS_NAMESPACE "storage"
+#define NVS_KEY_LAST_EPOCH "last_epoch"
+
 
 // Add this extern declaration:
 extern EventGroupHandle_t s_wifi_event_group; 
@@ -133,11 +139,11 @@ float readvoltage(void) {
     float v_bat = v_adc * ((R1 + R2) / R2);
 
     ESP_LOGI("Bat", "Battery raw is %.2f", v_bat);
-    return v_bat / 4.2;
+    return v_bat;
 }
 
 #define BATTERY_MAX_VOLTAGE 4.20f // 100% full charge
-#define BATTERY_MIN_VOLTAGE 3.00f // 0% discharged (cutoff voltage)
+#define BATTERY_MIN_VOLTAGE .00f // 0% discharged (cutoff voltage)
 
 /**
  * @brief Converts the measured battery voltage (Vbat) to a percentage (0-100%).
@@ -185,6 +191,28 @@ float voltage_to_percentage(float vbat_voltage) {
 
 uint64_t get_epoch_time(void)
 {
+    nvs_handle_t nvs_handle;
+    uint64_t last_epoch = 0;
+    esp_err_t err;
+    uint64_t estimated_epoch = 0;
+
+    // --- 1. Read last successful epoch from NVS ---
+    err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err == ESP_OK) {
+        err = nvs_get_u64(nvs_handle, NVS_KEY_LAST_EPOCH, &last_epoch);
+        nvs_close(nvs_handle);
+    }
+    
+    if (err == ESP_OK && last_epoch > 0) {
+        // Estimate the current time based on the last reading and sleep duration
+        estimated_epoch = last_epoch + SLEEP_INTERVAL_S;
+        ESP_LOGI("NTP", "Last synchronized epoch: %llu. Estimated current epoch: %llu", 
+                 (unsigned long long)last_epoch, (unsigned long long)estimated_epoch);
+    } else {
+        ESP_LOGW("NTP", "No valid last epoch found in NVS. Starting from 0.");
+    }
+    
+    // --- 2. Attempt NTP Synchronization ---
     ESP_LOGI("NTP", "Initializing SNTP");
     sntp_setoperatingmode(SNTP_OPMODE_POLL);
     sntp_setservername(0, "pool.ntp.org");
@@ -192,22 +220,53 @@ uint64_t get_epoch_time(void)
 
     int retry = 0;
     const int retry_count = 15;
-
-    // --- MODIFIED CONDITION HERE ---
+    
+    // Wait for sync or timeout
     while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED && retry < retry_count) {
-        // Log the current status to help debug why it might be failing
-        ESP_LOGI("NTP", "Waiting for system time... (Current Status: %d) (%d/%d)", 
+        ESP_LOGI("NTP", "Waiting for system time... (Status: %d) (%d/%d)", 
                  sntp_get_sync_status(), retry+1, retry_count);
-        
         vTaskDelay(pdMS_TO_TICKS(1000));
         retry++;
     }
-    // -------------------------------
+
+    time_t now_ntp;
+    time(&now_ntp); // Get time from RTC, whether synced or not
+
+    // --- 3. Process Result and Save to NVS ---
+    if (retry < 15) {
+        ESP_LOGI("NTP", "NTP synchronization SUCCESS. Epoch: %llu", (unsigned long long)now_ntp);
+        
+        // Save the new, valid time to NVS
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+            nvs_set_u64(nvs_handle, NVS_KEY_LAST_EPOCH, (uint64_t)now_ntp);
+            nvs_commit(nvs_handle);
+            nvs_close(nvs_handle);
+            ESP_LOGI("NTP", "New epoch saved to NVS.");
+        } else {
+            ESP_LOGE("NTP", "Failed to open NVS for writing!");
+        }
+        
+        // Return the successfully synchronized time
+        return (uint64_t)now_ntp;
+    } 
     
-    time_t now;
-    time(&now);
-    return (uint64_t)now;
+    // --- 4. NTP Failed: Fallback to Estimated Time ---
+    else {
+        ESP_LOGW("NTP", "NTP synchronization FAILED after %d attempts. Status: %d", retry, sntp_get_sync_status());
+        system_status = STATUS_NTP_FAIL;
+        
+        if (estimated_epoch > 0) {
+            ESP_LOGW("NTP", "Falling back to estimated epoch time: %llu", (unsigned long long)estimated_epoch);
+            
+            // Note: We don't save this estimated time back to NVS, only successfully synced time.
+            return estimated_epoch;
+        } else {
+            ESP_LOGE("NTP", "No estimated time available. Returning 0.");
+            return 0; 
+        }
+    }
 }
+
 void wifiinit(){
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
 
